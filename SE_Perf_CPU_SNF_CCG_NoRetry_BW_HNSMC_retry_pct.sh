@@ -34,7 +34,7 @@ CCG_WP_MASK=0xfffffff7fffc07ff
 usage() {
   cat <<'USAGE'
 Usage:
-  ./SE_Perf_CPU_SNF_NoRetry_BW.sh [options]
+  ./SE_Perf_CPU_SNF_CCG_NoRetry_BW_HNSMC_retry_pct.sh [options]
 
 Options:
   --out-dir DIR          Output directory. Default: current directory
