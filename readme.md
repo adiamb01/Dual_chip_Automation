@@ -1,53 +1,34 @@
-# Dual Chip Performance Automation
+# Phoenix Performance Automation
 
-## Overview
+This repository contains automation scripts for collecting CPU PMU and CMN performance statistics on Phoenix platforms.
 
-This repository contains automation scripts for collecting and parsing CPU PMU, CMN, SN-F, HNS Memory Controller (HNS MC), and CCG bandwidth statistics on Phoenix platforms.
+## Repository Contents
 
-The primary supported tool is:
-
-```bash
-SE_Perf_CPU_SNF_CCG_NoRetry_BW_HNSMC_retry_pct.sh
-```
-
-The script collects:
-
-* Per-CPU PMU read/write bandwidth
-* SN-F read/write bandwidth (write bandwidth excludes retries)
-* HNS Memory Controller request and retry statistics
-* Retry bandwidth and retry percentage
-* CCG C2C read/write bandwidth
-* Per-node and chip-level bandwidth summaries
+| Script                                              | Purpose                                                                |
+| --------------------------------------------------- | ---------------------------------------------------------------------- |
+| `SE_Perf_CPU_SNF_CCG_NoRetry_BW_HNSMC_retry_pct.sh` | CPU PMU, SN-F, HNS MC and CCG bandwidth collection                     |
+| `cbusy_throttle_automation.sh`                      | CPU CBusy, HN-S CBusy, PoCQ, L2 TQ, cache and memory-throttle analysis |
+| `backup/`                                           | Legacy scripts retained for reference                                  |
 
 ---
 
 # Prerequisites
 
-## 1. PMU Driver
+## PMU Driver
 
 Install the latest CESW CPU + CMN PMU driver.
 
-Verify that all required events are available:
+Verify the required events are available:
 
 ```bash
 perf list
 ```
 
-If the required events are missing, ensure the correct `perf` binary is installed.
-
-If necessary:
-
-```bash
-ln -sf <compiled_perf_binary> /usr/bin/perf
-```
-
-The compiled perf binary is released together with the CESW PMU driver.
+If necessary, use the latest perf binary released together with the PMU driver.
 
 ---
 
-## 2. Python Dependencies
-
-Install Python and OpenPyXL:
+## Python
 
 ```bash
 sudo apt-get update
@@ -58,13 +39,26 @@ python3 -m pip install openpyxl --break-system-packages
 
 ---
 
-# Running the Tool
+# 1. Bandwidth Collection
 
-1. Launch the workload.
-2. Ensure all workload threads have started.
-3. Execute the script.
+Script:
 
-Example:
+```text
+SE_Perf_CPU_SNF_CCG_NoRetry_BW_HNSMC_retry_pct.sh
+```
+
+## Metrics
+
+* Per-CPU PMU read bandwidth
+* Per-CPU PMU write bandwidth
+* SN-F read bandwidth
+* SN-F write bandwidth (retry excluded)
+* HNS MC request bandwidth
+* HNS MC retry bandwidth
+* HNS MC retry percentage
+* CCG C2C read/write bandwidth
+
+## Example
 
 ```bash
 ./SE_Perf_CPU_SNF_CCG_NoRetry_BW_HNSMC_retry_pct.sh \
@@ -73,138 +67,188 @@ Example:
     --cmn 0,1
 ```
 
-Collect only CMN0:
+### Output
+
+* `raw_perf_stats.txt`
+* `combined_perf_commands.txt`
+* `parsed_perf_stats.xlsx`
+
+Workbook contains:
+
+* RawData
+* CPU_PMU
+* SNF_NoRetry
+* SNF_MC
+* CCG_C2C
+* Summary
+
+---
+
+# 2. CBusy / Throttle Analysis
+
+Script:
+
+```text
+cbusy_throttle_automation.sh
+```
+
+## Metrics
+
+### CPU
+
+* Cycles
+* Instructions
+* IPC
+* Backend stalls
+* L2 TQ FULL
+* CBusy0
+* CBusy1
+* CBusy2
+* CBusy3
+* MT CBusy
+
+### CMN
+
+* HN-S CBusy0
+* HN-S CBusy1
+* HN-S CBusy2
+* HN-S CBusy3
+* PoCQ Occupancy
+* PoCQ Retry
+* Cache Accesses
+* Cache Misses
+* Cache Fills
+* Cache Evictions
+
+### Memory-side
+
+* HNS throttling
+* HNI stalls
+* HNP stalls
+* SBSX stalls
+* Memory backpressure events (when available)
+
+---
+
+## Example
+
+CMN0 only:
 
 ```bash
-./SE_Perf_CPU_SNF_CCG_NoRetry_BW_HNSMC_retry_pct.sh \
-    --out-dir results \
-    --sleep 1 \
-    --cmn 0
+./cbusy_throttle_automation.sh \
+    60 \
+    500 \
+    0 \
+    0 \
+    2.8GHz \
+    2.0GHz
 ```
 
-Useful options:
+Both CMNs:
 
-| Option                              | Description                                     |
-| ----------------------------------- | ----------------------------------------------- |
-| `--sleep`                           | Sampling duration for each perf command         |
-| `--cmn`                             | Collect CMN0, CMN1 or both (`0`, `1`, or `0,1`) |
-| `--out-dir`                         | Output directory                                |
-| `--run-only`                        | Collect raw perf data only                      |
-| `--parse-only <raw_perf_stats.txt>` | Parse an existing raw log                       |
-
----
-
-# Metrics Collected
-
-## CPU PMU
-
-Per-core PMU events:
-
-* Event `0x60` — Read bandwidth
-* Event `0x61` — Write bandwidth
-
-Bandwidth calculation:
-
-```
-Bandwidth = Event Count × 32 Bytes / Elapsed Time
+```bash
+./cbusy_throttle_automation.sh \
+    60 \
+    500 \
+    0 \
+    both \
+    2.8GHz \
+    2.0GHz
 ```
 
-Per-CPU bandwidth is reported for every monitored core.
+Arguments:
+
+| Argument  | Description                                |
+| --------- | ------------------------------------------ |
+| Duration  | Collection duration (seconds)              |
+| Interval  | Sampling interval (ms)                     |
+| CPU       | CPU list                                   |
+| CMN       | `0`, `1` or `both`                         |
+| CPU Clock | Used for L2 TQ normalization               |
+| CMN Clock | Used for HN-S CBusy and PoCQ normalization |
 
 ---
 
-## SN-F Bandwidth
+## Output
 
-Watchpoints:
+The script generates:
 
-| Metric           | Watchpoint    |
-| ---------------- | ------------- |
-| Read             | `0x800002000` |
-| Write (No Retry) | `0x80000e800` |
+```text
+raw/
+summary/
+meta/
+```
 
-Bandwidth calculation:
+under:
+
+```text
+/root/cmn_results/cbusy_snapshot_nomux_<timestamp>/
+```
+
+### Key output files
+
+| File                                      | Description             |
+| ----------------------------------------- | ----------------------- |
+| `summary.txt`                             | Human-readable report   |
+| `combined_summary.csv`                    | High-level KPIs (%)     |
+| `cpu_cbusy_per_node_percent.csv`          | Per-CPU CBusy           |
+| `cmn_hns_cbusy_per_hns_percent.csv`       | Per-HN-S CBusy          |
+| `cmn_pocq_occupancy_per_hns_with_pct.csv` | Per-HN-S PoCQ occupancy |
+
+---
+
+## Normalization
+
+The script reports normalized percentages.
+
+### CPU L2 TQ
 
 ```
-Bandwidth = Watchpoint Count × 64 Bytes / Elapsed Time
+L2_TQ % =
+Count /
+(CPU Clock × Sample Time)
 ```
 
----
+### HN-S CBusy
 
-## HNS Memory Controller
+Each CBusy level is normalized independently.
 
-Counters collected:
+```
+CBusy % =
+Count /
+(CMN Clock × Sample Time × Number of HN-S monitored)
+```
 
-* `hns_mc_reqs_local_sn`
-* `hns_mc_retries_local_sn`
-* `hns_mc_reqs_remote_sn`
-* `hns_mc_retries_remote_sn`
+CBusy levels are **not** summed before normalization.
 
-The report computes:
+### PoCQ Occupancy
 
-* Total request bandwidth
-* Retry bandwidth
-* Effective bandwidth (excluding retries)
-* Retry percentage
+```
+PoCQ % =
+Count /
+(CMN Clock × Sample Time × Number of HN-S monitored)
+```
 
----
-
-## CCG C2C
-
-The script reports:
-
-* Read bandwidth
-* Clean write bandwidth
-* Dirty write bandwidth
-
-for both:
-
-* `watchpoint_up`
-* `watchpoint_down`
+If only CMN0 or CMN1 is selected, the HN-S divisor is automatically adjusted.
 
 ---
 
-# Output Files
+# Parsing Existing Results
 
-The following files are generated inside the output directory.
-
-| File                         | Description             |
-| ---------------------------- | ----------------------- |
-| `raw_perf_stats.txt`         | Raw perf output         |
-| `combined_perf_commands.txt` | Generated perf commands |
-| `parsed_perf_stats.xlsx`     | Parsed Excel report     |
-
----
-
-# Excel Workbook
-
-The workbook contains the following worksheets:
-
-* **RawData** – Raw parsed perf output
-* **CPU_PMU** – Per-CPU bandwidth
-* **SNF_NoRetry** – SN-F bandwidth
-* **SNF_MC** – HNS MC requests, retries, retry percentage
-* **CCG_C2C** – CCG bandwidth
-* **Summary** – Chip-level bandwidth summary
-
----
-
-# Re-parsing Existing Data
-
-If `parsed_perf_stats.xlsx` is lost but `raw_perf_stats.txt` is available, regenerate the Excel report using:
+Bandwidth:
 
 ```bash
 ./SE_Perf_CPU_SNF_CCG_NoRetry_BW_HNSMC_retry_pct.sh \
     --parse-only raw_perf_stats.txt
 ```
 
----
+CBusy:
 
-# Notes
-
-* Default logs are written to the specified output directory.
-* All generated files can be copied from the target using `scp`.
-* Legacy scripts are archived under the `backup/` directory.
-* CPU bandwidth is reported per CPU and summarized per chip.
-* SN-F write bandwidth excludes retry traffic.
-* HNS MC retry percentage is computed using the `_sn` request and retry counters.
+```bash
+./cbusy_throttle_automation.sh \
+    --parse-only \
+    <capture_directory> \
+    2.8GHz \
+    2.0GHz
+```
 

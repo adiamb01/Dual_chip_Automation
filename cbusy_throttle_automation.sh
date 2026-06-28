@@ -52,6 +52,43 @@ normalize_cpu_clock_hz() {
   }'
 }
 
+count_list_ranges() {
+  local list="${1:-}"
+  list="${list//,/ }"
+  local item start end count=0
+  for item in $list; do
+    [[ -z "$item" || "$item" == "parse-only" ]] && continue
+    if [[ "$item" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      start="${BASH_REMATCH[1]}"
+      end="${BASH_REMATCH[2]}"
+      if (( end >= start )); then
+        count=$((count + end - start + 1))
+      fi
+    elif [[ "$item" =~ ^[0-9]+$ ]]; then
+      count=$((count + 1))
+    fi
+  done
+  echo "$count"
+}
+
+count_hns_nodes_from_string() {
+  local ids="${1:-$DEFAULT_HNS_NODE_IDS}"
+  ids="${ids//,/ }"
+  local n=0 id
+  for id in $ids; do
+    [[ -n "$id" ]] && n=$((n + 1))
+  done
+  echo "$n"
+}
+
+cmn_count_from_sel() {
+  local sel="${1:-0}"
+  case "$sel" in
+    both|all|0,1|1,0) echo 2 ;;
+    *) echo 1 ;;
+  esac
+}
+
 PARSE_ONLY=0
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   usage
@@ -384,6 +421,35 @@ run_pass_sys dmc_cbusy_mem_backpressure "${DMC_EVENTS[@]}"
 fi
 
 # -----------------------------
+# Normalization context
+# -----------------------------
+# CBusy and PoCQ counts are event counts over each perf interval.  The normalized
+# percentage for each event bucket is count / (clock_hz * interval_s) * 100.
+# For aggregate HN-S events that include all monitored HN-S nodes, divide by the
+# number of HN-S nodes monitored as well.  Per-HN-S bynodeid views are already
+# one HN-S node and are not divided by total HN-S count again.
+NORM_CMN_SEL="$CMN_SEL"
+NORM_CPU_LIST="$CPU_LIST"
+if [[ "$PARSE_ONLY" -eq 1 && -f "$OUT/run_info.txt" ]]; then
+  NORM_CMN_SEL="$(sed -n 's/.*CMN_SEL=\([^ ]*\).*/\1/p' "$OUT/run_info.txt" | tail -1)"
+  NORM_CPU_LIST="$(sed -n 's/.*CPU_LIST=\([^ ]*\).*/\1/p' "$OUT/run_info.txt" | tail -1)"
+fi
+CMN_COUNT_FOR_NORM="$(cmn_count_from_sel "$NORM_CMN_SEL")"
+HNS_PER_CMN_COUNT="$(count_hns_nodes_from_string "${HNS_NODE_IDS:-$DEFAULT_HNS_NODE_IDS}")"
+HNS_PER_NODE_COUNT="${HNS_PER_NODE_COUNT:-2}"
+HNS_MONITORED_COUNT=$((HNS_PER_CMN_COUNT * HNS_PER_NODE_COUNT * CMN_COUNT_FOR_NORM))
+CPU_MONITORED_COUNT="$(count_list_ranges "$NORM_CPU_LIST")"
+[[ "$CPU_MONITORED_COUNT" -gt 0 ]] || CPU_MONITORED_COUNT=1
+[[ "$HNS_MONITORED_COUNT" -gt 0 ]] || HNS_MONITORED_COUNT=1
+{
+  echo "CMN_COUNT_FOR_NORM=$CMN_COUNT_FOR_NORM"
+  echo "HNS_PER_CMN_COUNT=$HNS_PER_CMN_COUNT"
+  echo "HNS_PER_NODE_COUNT=$HNS_PER_NODE_COUNT"
+  echo "HNS_MONITORED_COUNT=$HNS_MONITORED_COUNT"
+  echo "CPU_MONITORED_COUNT=$CPU_MONITORED_COUNT"
+} > "$OUT/meta/normalization_context.txt"
+
+# -----------------------------
 # Parser: raw avg, max, sample count, elapsed, running %
 # -----------------------------
 cat > "$OUT/parse_perf_csv.awk" <<'AWK'
@@ -577,22 +643,52 @@ if [[ -f "$OUT/run_info.txt" ]]; then
   esac
 fi
 
-# CMN HN-S CBusy percent
-awk -F, '
-/hns_cbusy00_all/{cb0+=$2;n++}
-/hns_cbusy01_all/{cb1+=$2}
-/hns_cbusy02_all/{cb2+=$2}
-/hns_cbusy03_all/{cb3+=$2}
+# Common interval used for CMN clock-normalized CBusy/PoCQ calculations.
+POCQ_INTERVAL_MS="$INTERVAL_MS"
+if [[ "$PARSE_ONLY" -eq 1 && -f "$OUT/run_info.txt" ]]; then
+  POCQ_INTERVAL_MS="$(sed -n 's/.*INTERVAL_MS=\([^ ]*\).*/\1/p' "$OUT/run_info.txt" | tail -1)"
+fi
+
+# CMN HN-S CBusy clock-normalized percent.
+# IMPORTANT: CMN/HN-S counters on this platform behave as cumulative counts over
+# the pass in perf -I output.  Therefore percent must use the final/max count and
+# elapsed time, not the arithmetic average of rows divided by interval_ms.
+#
+# Aggregate formula:
+#   pct = final_count / (CMN_CLOCK_HZ * elapsed_s * HNS_MONITORED_COUNT) * 100
+# Each cbusy level is normalized independently.  Do not compute a relative split
+# by summing cbusy00..03 first.
+awk -F, -v cmn_alias="$CMN_ALIAS" -v clk_hz="$CMN_CLOCK_HZ_NORM" -v hns_count="$HNS_MONITORED_COUNT" '
+function trim(x){gsub(/^ +| +$/, "", x); return x}
+function add(cmn,bucket,val,ts){
+  key=cmn "," bucket;
+  if(val>max[key]) max[key]=val;
+  if(ts>elapsed[key]) elapsed[key]=ts;
+  seen[key]=1;
+  buckets[bucket]=1;
+}
+$1 ~ /^#/ {next}
+{
+  ts=$1+0; val=trim($2); ev=trim($4);
+  if(ev=="" || val=="" || val ~ /<not/) next;
+  cmn=cmn_alias;
+  if(match(ev, /arm_cmn_[0-9]+/)) cmn=substr(ev,RSTART,RLENGTH);
+  else if(match(ev, /arm_cmn\//)) cmn=cmn_alias;
+  if(ev ~ /hns_cbusy00_all/) add(cmn,"hns_cbusy00_all",val+0,ts);
+  else if(ev ~ /hns_cbusy01_all/) add(cmn,"hns_cbusy01_all",val+0,ts);
+  else if(ev ~ /hns_cbusy02_all/) add(cmn,"hns_cbusy02_all",val+0,ts);
+  else if(ev ~ /hns_cbusy03_all/) add(cmn,"hns_cbusy03_all",val+0,ts);
+}
 END {
-  if(n==0)n=1;
-  total=cb0+cb1+cb2+cb3;
-  if(total==0)total=1;
-  print "metric,value";
-  printf "hns_cbusy_total_avg,%.0f\n", total/n;
-  printf "hns_cbusy00_pct,%.2f\n", 100*cb0/total;
-  printf "hns_cbusy01_pct,%.2f\n", 100*cb1/total;
-  printf "hns_cbusy02_pct,%.2f\n", 100*cb2/total;
-  printf "hns_cbusy03_pct,%.2f\n", 100*cb3/total;
+  print "metric,final_count,cmn_clock_hz,elapsed_s,hns_monitored_count,value_pct";
+  for(i=0;i<=3;i++){
+    b=sprintf("hns_cbusy%02d_all", i);
+    total=0; el=0;
+    for(k in seen){ split(k,a,","); if(a[2]==b){ total+=max[k]; if(elapsed[k]>el) el=elapsed[k]; } }
+    denom=(clk_hz+0)*el*(hns_count+0);
+    pct=(denom>0 ? 100*total/denom : 0);
+    printf "%s,%.0f,%.0f,%.6f,%d,%.9f\n", b, total, clk_hz+0, el, hns_count+0, pct;
+  }
 }' "$OUT/raw/cmn_hns_cbusy.csv" > "$OUT/summary/cmn_hns_cbusy_percent.csv"
 
 # CMN HN-S CBusy per HN-S nodeid, when raw events include bynodeid/nodeid selectors.
@@ -628,45 +724,33 @@ END {
   for(key in n) printf "%s,%.0f,%.0f,%d,%.3f,%.2f\n", key, sum[key]/n[key], max[key], n[key], last_ts[key], run_sum[key]/n[key];
 }' "$OUT/raw/cmn_hns_cbusy_hns.csv" > "$OUT/summary/cmn_hns_cbusy_per_hns_summary.csv" 2>/dev/null || true
 
-# CMN HN-S CBusy per HN-S percent split. Percentages are per CMN+HNS nodeid.
-# Also create a detailed file that keeps one row per cbusy event and adds pct_of_node_total.
-awk -F, '
+# CMN HN-S CBusy per HN-S percent.
+# Per-node formula:
+#   pct = final_count / (CMN_CLOCK_HZ * elapsed_s * HNS_PER_NODE_COUNT) * 100
+awk -F, -v clk_hz="$CMN_CLOCK_HZ_NORM" -v hns_per_node="$HNS_PER_NODE_COUNT" '
 NR==1{next}
 {
   cmn=$1; hns=$2; ev=$3; avg=$4+0; maxv=$5+0; samples=$6+0; elapsed=$7+0; runpct=$8+0;
-  key=cmn "," hns; rowkey=key "," ev;
-  avgv[rowkey]=avg; maxval[rowkey]=maxv; samplev[rowkey]=samples; elapsedv[rowkey]=elapsed; runpctv[rowkey]=runpct;
-  if(ev ~ /hns_cbusy00_all/) cb0[key]+=avg;
-  else if(ev ~ /hns_cbusy01_all/) cb1[key]+=avg;
-  else if(ev ~ /hns_cbusy02_all/) cb2[key]+=avg;
-  else if(ev ~ /hns_cbusy03_all/) cb3[key]+=avg;
-  seen[key]=1; seenrow[rowkey]=1;
+  denom=(clk_hz+0)*elapsed*(hns_per_node+0);
+  pct=(denom>0 ? 100*maxv/denom : 0);
+  rows[cmn "," hns "," ev]=cmn "," hns "," ev "," avg "," maxv "," pct "," samples "," elapsed "," runpct;
 }
 END{
   print "cmn,hns_nodeid,metric,value" > PCTFILE;
-  print "cmn,hns_nodeid,event,avg,pct_of_node_total,max,samples,elapsed_s,avg_running_pct" > DETAILFILE;
-  for(k in seen){
-    actual_total=cb0[k]+cb1[k]+cb2[k]+cb3[k]; total=actual_total; if(total==0) total=1;
-    print k ",hns_cbusy_total_avg," actual_total >> PCTFILE;
-    printf "%s,hns_cbusy00_pct,%.2f\n", k, 100*cb0[k]/total >> PCTFILE;
-    printf "%s,hns_cbusy01_pct,%.2f\n", k, 100*cb1[k]/total >> PCTFILE;
-    printf "%s,hns_cbusy02_pct,%.2f\n", k, 100*cb2[k]/total >> PCTFILE;
-    printf "%s,hns_cbusy03_pct,%.2f\n", k, 100*cb3[k]/total >> PCTFILE;
-  }
-  for(r in seenrow){
-    split(r,a,","); k=a[1] "," a[2]; ev=a[3];
-    actual_total=cb0[k]+cb1[k]+cb2[k]+cb3[k]; total=actual_total; if(total==0) total=1;
-    pct=100*avgv[r]/total;
-    printf "%s,%s,%s,%.0f,%.2f,%.0f,%d,%.3f,%.2f\n", a[1],a[2],ev,avgv[r],pct,maxval[r],samplev[r],elapsedv[r],runpctv[r] >> DETAILFILE;
+  print "cmn,hns_nodeid,event,avg,final_count,value_pct_of_cmn_clock,samples,elapsed_s,avg_running_pct" > DETAILFILE;
+  for(k in rows){
+    print rows[k] >> DETAILFILE;
+    split(rows[k],a,",");
+    print a[1] "," a[2] "," a[3] "_pct_of_cmn_clock," a[6] >> PCTFILE;
   }
 }' PCTFILE="$OUT/summary/cmn_hns_cbusy_per_hns_percent.csv" \
    DETAILFILE="$OUT/summary/cmn_hns_cbusy_per_hns_summary_with_pct.csv" \
    "$OUT/summary/cmn_hns_cbusy_per_hns_summary.csv" 2>/dev/null || true
 
-# L2 TQ full per CPU node/core. If old raw data was not captured with -A, emit aggregate.
-# Optional normalized percentage uses CPU_CLOCK_HZ and the perf interval:
-#   L2_TQ_FULL_pct = count / (CPU_CLOCK_HZ * interval_seconds) * 100
-# Pass CPU clock as arg 5, env CPU_CLOCK_HZ, or with --parse-only OUT_DIR CPU_CLOCK.
+# L2 TQ full per CPU node/core.
+# Use final/max count and elapsed time:
+#   pct = final_count / (CPU_CLOCK_HZ * elapsed_s) * 100
+# If old aggregate raw data is present, divide by CPU_MONITORED_COUNT as well.
 L2_INTERVAL_MS="$INTERVAL_MS"
 if [[ "$PARSE_ONLY" -eq 1 && -f "$OUT/run_info.txt" ]]; then
   L2_INTERVAL_MS="$(sed -n 's/.*INTERVAL_MS=\([^ ]*\).*/\1/p' "$OUT/run_info.txt" | tail -1)"
@@ -675,103 +759,80 @@ if [[ -z "${CPU_CLOCK_HZ_NORM:-}" && -f "$OUT/run_info.txt" ]]; then
   CPU_CLOCK_HZ_NORM="$(sed -n 's/.*CPU_CLOCK_HZ=\([^ ]*\).*/\1/p' "$OUT/run_info.txt" | tail -1)"
 fi
 : "${CPU_CLOCK_HZ_NORM:=}"
-awk -F, -v clk_hz="$CPU_CLOCK_HZ_NORM" -v interval_ms="$L2_INTERVAL_MS" -v pctfile="$OUT/summary/cpu_l2_tq_full_per_node_with_pct.csv" '
+awk -F, -v clk_hz="$CPU_CLOCK_HZ_NORM" -v cpu_count="$CPU_MONITORED_COUNT" -v pctfile="$OUT/summary/cpu_l2_tq_full_per_node_with_pct.csv" '
 {
-  ev=""; val=""; node="aggregate";
+  ts=$1+0; ev=""; val=""; node="aggregate";
   for(i=1;i<=NF;i++){
     gsub(/^ +| +$/, "", $i);
     if($i=="r157"){
-      ev=$i;
-      val=$(i-2);
-      node=$(i-3);
+      ev=$i; val=$(i-2); node=$(i-3);
       if(node=="" || node ~ /^[0-9.]+$/) node="aggregate";
     }
   }
-  # Old non -A layout is: time,value,,r157,...
   if(ev=="" && $4=="r157"){ ev=$4; val=$2; node="aggregate"; }
   if(ev=="" || val=="" || val ~ /<not/) next;
-  sum[node]+=val+0;
-  n[node]++;
+  sum[node]+=val+0; n[node]++;
   if((val+0)>max[node]) max[node]=val+0;
+  if(ts>elapsed[node]) elapsed[node]=ts;
 }
 END {
   print "node,metric,avg,max,samples";
-  print "node,metric,avg,max,samples,cpu_clock_hz,interval_s,l2_tq_pct_avg,l2_tq_pct_max" > pctfile;
-  interval_s=(interval_ms+0)/1000.0;
-  denom=(clk_hz+0)*interval_s;
+  print "node,metric,avg,final_count,samples,cpu_clock_hz,elapsed_s,cpu_divisor,l2_tq_pct" > pctfile;
   for(node in n){
-    avg=sum[node]/n[node]; maxv=max[node];
+    avg=sum[node]/n[node]; maxv=max[node]; divisor=1;
+    if(node=="aggregate") divisor=(cpu_count+0);
+    if(divisor<=0) divisor=1;
+    denom=(clk_hz+0)*elapsed[node]*divisor;
+    pct=(denom>0 ? 100*maxv/denom : 0);
     printf "%s,L2_TQ_FULL_r157,%.0f,%.0f,%d\n", node, avg, maxv, n[node];
-    if(denom>0){
-      printf "%s,L2_TQ_FULL_r157,%.0f,%.0f,%d,%.0f,%.6f,%.2f,%.2f\n", node, avg, maxv, n[node], clk_hz+0, interval_s, 100*avg/denom, 100*maxv/denom >> pctfile;
-    } else {
-      printf "%s,L2_TQ_FULL_r157,%.0f,%.0f,%d,,%.6f,,\n", node, avg, maxv, n[node], interval_s >> pctfile;
-    }
+    printf "%s,L2_TQ_FULL_r157,%.0f,%.0f,%d,%.0f,%.6f,%d,%.9f\n", node, avg, maxv, n[node], clk_hz+0, elapsed[node], divisor, pct >> pctfile;
   }
 }' "$OUT/raw/cpu_l2_tq_full.csv" > "$OUT/summary/cpu_l2_tq_full_per_node.csv" 2>/dev/null || true
 
-# CMN PoCQ occupancy normalization uses CMN_CLOCK_HZ and the perf interval:
-#   pocq_occupancy_pct = occupancy_count / (CMN_CLOCK_HZ * interval_seconds) * 100
-POCQ_INTERVAL_MS="$INTERVAL_MS"
-if [[ "$PARSE_ONLY" -eq 1 && -f "$OUT/run_info.txt" ]]; then
-  POCQ_INTERVAL_MS="$(sed -n 's/.*INTERVAL_MS=\([^ ]*\).*/\1/p' "$OUT/run_info.txt" | tail -1)"
-fi
+# CMN PoCQ occupancy normalization.
+# Aggregate formula:
+#   pct = final_count / (CMN_CLOCK_HZ * elapsed_s * HNS_MONITORED_COUNT) * 100
 if [[ -z "${CMN_CLOCK_HZ_NORM:-}" && -f "$OUT/run_info.txt" ]]; then
   CMN_CLOCK_HZ_NORM="$(sed -n 's/.*CMN_CLOCK_HZ=\([^ ]*\).*/\1/p' "$OUT/run_info.txt" | tail -1)"
 fi
 : "${CMN_CLOCK_HZ_NORM:=}"
 
-# CMN PoCQ per CMN PMU/node. This keeps arm_cmn_0 and arm_cmn_1 separate when present.
-awk -F, -v cmn_alias="$CMN_ALIAS" -v clk_hz="$CMN_CLOCK_HZ_NORM" -v interval_ms="$POCQ_INTERVAL_MS" -v pctfile="$OUT/summary/cmn_pocq_occupancy_per_node_with_pct.csv" '
+awk -F, -v cmn_alias="$CMN_ALIAS" -v clk_hz="$CMN_CLOCK_HZ_NORM" -v hns_count="$HNS_MONITORED_COUNT" -v pctfile="$OUT/summary/cmn_pocq_occupancy_per_node_with_pct.csv" '
+function trim(x){gsub(/^ +| +$/, "", x); return x}
+function add(cmn,short,val,ts){
+  key=cmn "," short;
+  if(val>max[key]) max[key]=val;
+  if(ts>elapsed[key]) elapsed[key]=ts;
+  seen[key]=1;
+  events[short]=1;
+}
 {
-  ts=$1+0;
-  ev=$4;
-  val=$2;
-  ena=$5+0;
-  run=$6+0;
-  gsub(/^ +| +$/, "", ev);
-  gsub(/^ +| +$/, "", val);
+  ts=$1+0; ev=trim($4); val=trim($2);
   if(ev=="" || val=="" || val ~ /<not/) next;
   if(ev !~ /pocq/) next;
-  cmn="unknown_cmn";
-  short=ev;
-  if(match(ev, /arm_cmn_[0-9]+/)) {
-    cmn=substr(ev, RSTART, RLENGTH);
-    gsub(/^arm_cmn_[0-9]+\//, "", short);
-  } else if(match(ev, /arm_cmn\//)) {
-    cmn=cmn_alias;
-    gsub(/^arm_cmn\//, "", short);
-  }
+  cmn=cmn_alias; short=ev;
+  if(match(ev, /arm_cmn_[0-9]+/)) { cmn=substr(ev,RSTART,RLENGTH); gsub(/^arm_cmn_[0-9]+\//,"",short); }
+  else if(match(ev, /arm_cmn\//)) { cmn=cmn_alias; gsub(/^arm_cmn\//,"",short); }
   gsub(/\/$/, "", short);
-  key=cmn "," short;
-  pct=100.0;
-  if(ena>0 && run>0) pct=(run/ena)*100.0;
-  sum[key]+=val+0;
-  n[key]++;
-  if((val+0)>max[key]) max[key]=val+0;
-  if(ts>last_ts[key]) last_ts[key]=ts;
-  run_sum[key]+=pct;
+  add(cmn, short, val+0, ts);
 }
 END {
   print "cmn,event,avg,max,samples,elapsed_s,avg_running_pct";
-  print "cmn,event,avg,max,samples,cmn_clock_hz,interval_s,pocq_occupancy_pct_avg,pocq_occupancy_pct_max" > pctfile;
-  interval_s=(interval_ms+0)/1000.0; denom=(clk_hz+0)*interval_s;
-  for(key in n){
-    avg=sum[key]/n[key]; maxv=max[key];
-    printf "%s,%.0f,%.0f,%d,%.3f,%.2f\n", key, avg, maxv, n[key], last_ts[key], run_sum[key]/n[key];
-    split(key,a,","); ev=a[2];
-    if(ev ~ /occup/) {
-      if(denom>0) printf "%s,%.0f,%.0f,%d,%.0f,%.6f,%.2f,%.2f\n", key, avg, maxv, n[key], clk_hz+0, interval_s, 100*avg/denom, 100*maxv/denom >> pctfile;
-      else printf "%s,%.0f,%.0f,%d,,%.6f,,\n", key, avg, maxv, n[key], interval_s >> pctfile;
-    }
+  print "event,final_count,cmn_clock_hz,elapsed_s,hns_monitored_count,value_pct" > pctfile;
+  for(e in events){
+    total=0; el=0;
+    for(k in seen){ split(k,a,","); if(a[2]==e){ total+=max[k]; if(elapsed[k]>el) el=elapsed[k]; } }
+    denom=(clk_hz+0)*el*(hns_count+0);
+    pct=(denom>0 ? 100*total/denom : 0);
+    printf "%s,%.0f,%.0f,%.6f,%d,%.9f\n", e, total, clk_hz+0, el, hns_count+0, pct >> pctfile;
   }
+  for(k in seen) printf "%s,0,%.0f,1,%.3f,100.00\n", k, max[k], elapsed[k];
 }' "$OUT/raw/cmn_pocq.csv" > "$OUT/summary/cmn_pocq_per_node_summary.csv" 2>/dev/null || true
 
-
-# CMN PoCQ per HN-S node, when raw events include bynodeid/nodeid selectors.
-# Note: perf -x, does not quote commas inside event names, so reconstruct the
-# event field by scanning for arm_cmn... through nodeid=.../.
-awk -F, -v cmn_alias="$CMN_ALIAS" -v clk_hz="$CMN_CLOCK_HZ_NORM" -v interval_ms="$POCQ_INTERVAL_MS" -v pctfile="$OUT/summary/cmn_pocq_occupancy_per_hns_with_pct.csv" '
+# CMN PoCQ per HN-S node.
+# Per-node formula:
+#   pct = final_count / (CMN_CLOCK_HZ * elapsed_s * HNS_PER_NODE_COUNT) * 100
+awk -F, -v cmn_alias="$CMN_ALIAS" -v clk_hz="$CMN_CLOCK_HZ_NORM" -v hns_per_node="$HNS_PER_NODE_COUNT" -v pctfile="$OUT/summary/cmn_pocq_occupancy_per_hns_with_pct.csv" '
 {
   ts=$1+0; val=$2; ev=""; ena=0; run=0;
   gsub(/^ +| +$/, "", val);
@@ -794,71 +855,118 @@ awk -F, -v cmn_alias="$CMN_ALIAS" -v clk_hz="$CMN_CLOCK_HZ_NORM" -v interval_ms=
   sub(/,bynodeid=1,nodeid=[^\/]+\/$/, "", short);
   gsub(/\/$/, "", short);
   key=cmn "," hns "," short;
-  pct=100.0; if(ena>0 && run>0) pct=(run/ena)*100.0;
   sum[key]+=val+0; n[key]++; if((val+0)>max[key]) max[key]=val+0;
-  if(ts>last_ts[key]) last_ts[key]=ts; run_sum[key]+=pct;
+  if(ts>elapsed[key]) elapsed[key]=ts;
 }
 END {
   print "cmn,hns_nodeid,event,avg,max,samples,elapsed_s,avg_running_pct";
-  print "cmn,hns_nodeid,event,avg,max,samples,cmn_clock_hz,interval_s,pocq_occupancy_pct_avg,pocq_occupancy_pct_max" > pctfile;
-  interval_s=(interval_ms+0)/1000.0; denom=(clk_hz+0)*interval_s;
+  print "cmn,hns_nodeid,event,avg,final_count,samples,cmn_clock_hz,elapsed_s,hns_per_node,value_pct" > pctfile;
   for(key in n) {
-    avg=sum[key]/n[key]; maxv=max[key];
-    printf "%s,%.0f,%.0f,%d,%.3f,%.2f\n", key, avg, maxv, n[key], last_ts[key], run_sum[key]/n[key];
-    split(key,a,","); ev=a[3];
-    if(ev ~ /occup/) {
-      if(denom>0) printf "%s,%.0f,%.0f,%d,%.0f,%.6f,%.2f,%.2f\n", key, avg, maxv, n[key], clk_hz+0, interval_s, 100*avg/denom, 100*maxv/denom >> pctfile;
-      else printf "%s,%.0f,%.0f,%d,,%.6f,,\n", key, avg, maxv, n[key], interval_s >> pctfile;
-    }
+    avg=sum[key]/n[key]; maxv=max[key]; denom=(clk_hz+0)*elapsed[key]*(hns_per_node+0);
+    pct=(denom>0 ? 100*maxv/denom : 0);
+    printf "%s,%.0f,%.0f,%d,%.3f,100.00\n", key, avg, maxv, n[key], elapsed[key];
+    printf "%s,%.0f,%.0f,%d,%.0f,%.6f,%d,%.9f\n", key, avg, maxv, n[key], clk_hz+0, elapsed[key], hns_per_node+0, pct >> pctfile;
   }
 }' "$OUT/raw/cmn_pocq_hns.csv" > "$OUT/summary/cmn_pocq_per_hns_summary.csv" 2>/dev/null || true
 
 # Always create combined summaries.
-# Build via a temporary file and explicitly skip combined_summary.csv so the
-# loop never reads the file it is currently generating.
-combined_tmp="$OUT/summary/combined_summary.csv.tmp.$$"
-{
-  echo "section,metric,value"
-  find "$OUT/summary" -maxdepth 1 -type f \( \
-      -name '*_summary.csv' -o \
-      -name '*_percent.csv' -o \
-      -name '*_per_node.csv' -o \
-      -name '*_per_node_with_pct.csv' -o \
-      -name '*_per_hns_summary.csv' -o \
-      -name '*_per_hns_percent.csv' -o \
-      -name '*_per_hns_with_pct.csv' \
-    \) ! -name 'combined_summary.csv' ! -name 'combined_summary.csv.tmp.*' | sort | while read -r f; do
-    [[ -s "$f" ]] || continue
-    sec="$(basename "$f" .csv)"
-    awk -F, -v sec="$sec" '
-      NR==1{h=$0; next}
-      h ~ /^cmn,hns_nodeid,event,avg,max,samples,cmn_clock_hz,interval_s,pocq_occupancy_pct_avg,pocq_occupancy_pct_max/ {
-        print sec "," $1 ":" $2 ":" $3 ":pocq_occupancy_pct_avg," $9;
-        print sec "," $1 ":" $2 ":" $3 ":pocq_occupancy_pct_max," $10;
-        print sec "," $1 ":" $2 ":" $3 ":avg," $4;
-        next
-      }
-      h ~ /^cmn,event,avg,max,samples,cmn_clock_hz,interval_s,pocq_occupancy_pct_avg,pocq_occupancy_pct_max/ {
-        print sec "," $1 ":" $2 ":pocq_occupancy_pct_avg," $8;
-        print sec "," $1 ":" $2 ":pocq_occupancy_pct_max," $9;
-        print sec "," $1 ":" $2 ":avg," $3;
-        next
-      }
-      h ~ /^node,metric,avg,max,samples,cpu_clock_hz,interval_s,l2_tq_pct_avg,l2_tq_pct_max/ {
-        print sec "," $1 ":" $2 ":l2_tq_pct_avg," $8;
-        print sec "," $1 ":" $2 ":l2_tq_pct_max," $9;
-        print sec "," $1 ":" $2 ":avg," $3;
-        next
-      }
-      h ~ /^cmn,hns_nodeid,event,/ {print sec "," $1 ":" $2 ":" $3 "," $4; next}
-      h ~ /^cmn,hns_nodeid,metric,/ {print sec "," $1 ":" $2 ":" $3 "," $4; next}
-      h ~ /^cmn,event,/ {print sec "," $1 ":" $2 "," $3; next}
-      h ~ /^node,metric,/ {print sec "," $1 ":" $2 "," $3; next}
-      {print sec "," $1 "," $2}
-    ' "$f"
-  done
-} > "$combined_tmp"
-mv -f "$combined_tmp" "$OUT/summary/combined_summary.csv"
+# Keep combined_summary.csv intentionally simple: section,metric,value.
+# Only percentage/KPI values are emitted here. Raw counts, averages and max
+# values remain in the detailed CSVs under $OUT/summary.
+python3 - "$OUT/summary" <<'PYCOMBINED'
+import csv
+import sys
+from pathlib import Path
+
+summary_dir = Path(sys.argv[1])
+out_file = summary_dir / "combined_summary.csv"
+
+# Include only high-level KPI files. Detailed raw/count summaries stay separate.
+include_names = [
+    "cpu_core_summary.csv",
+    "cpu_cbusy_percent.csv",
+    "cpu_cbusy_per_node_percent.csv",
+    "cpu_l2_tq_full_per_node_with_pct.csv",
+    "cmn_hns_cbusy_percent.csv",
+    "cmn_hns_cbusy_per_hns_percent.csv",
+    "cmn_hns_cbusy_per_hns_summary_with_pct.csv",
+    "cmn_pocq_occupancy_per_node_with_pct.csv",
+    "cmn_pocq_occupancy_per_hns_with_pct.csv",
+]
+
+# Columns that are percentages/KPIs and should be surfaced in combined_summary.
+value_columns = [
+    "value_pct",
+    "l2_tq_pct",
+    "l2_tq_pct_avg",
+    "pocq_occupancy_pct_avg",
+    "pct_of_node_total",
+    "value",
+]
+
+# For cpu_core_summary, keep only the useful scalar KPIs.
+cpu_core_keep = {"ipc", "stall_backend_avg"}
+
+# In metric,value files, keep values whose metric name looks like a percent/KPI.
+def keep_metric_value(section: str, metric: str) -> bool:
+    ml = metric.lower()
+    if section == "cpu_core_summary":
+        return ml in cpu_core_keep
+    return (
+        "pct" in ml
+        or "percent" in ml
+        or "ratio" in ml
+        or ml.startswith("cbusy")
+        or ml.startswith("hns_cbusy")
+        or ml.startswith("pocq")
+        or ml.startswith("l2_tq")
+    )
+
+def pick_value(row):
+    for col in value_columns:
+        if col in row and row[col] not in (None, ""):
+            return row[col]
+    return None
+
+def pick_metric(row):
+    parts = []
+    for col in ("cmn", "hns_nodeid", "node", "event", "metric"):
+        val = row.get(col, "")
+        if val not in (None, ""):
+            parts.append(val)
+    return ":".join(parts) if parts else None
+
+with out_file.open("w", newline="") as fo:
+    writer = csv.writer(fo)
+    writer.writerow(["section", "metric", "value"])
+
+    for name in include_names:
+        path = summary_dir / name
+        if not path.exists() or path.stat().st_size == 0:
+            continue
+        section = path.stem
+        with path.open(newline="") as fi:
+            reader = csv.DictReader(fi)
+            if not reader.fieldnames:
+                continue
+            for row in reader:
+                metric = pick_metric(row)
+                value = pick_value(row)
+                if metric is None or value is None:
+                    continue
+
+                # For simple metric,value files, filter by metric name.
+                if set(reader.fieldnames) == {"metric", "value"}:
+                    if not keep_metric_value(section, metric):
+                        continue
+                else:
+                    # For detailed files, only keep rows that expose percent columns.
+                    percent_cols = {"value_pct", "l2_tq_pct", "l2_tq_pct_avg", "pocq_occupancy_pct_avg", "pct_of_node_total"}
+                    if not any(c in reader.fieldnames for c in percent_cols):
+                        continue
+
+                writer.writerow([section, metric, value])
+PYCOMBINED
 
 # Human-readable compact summary.
 {
